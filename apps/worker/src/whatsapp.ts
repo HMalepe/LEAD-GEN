@@ -26,6 +26,17 @@ export interface InboundMessage {
   type: string;
   text: string; // '' for unsupported types
   profileName?: string;
+  /** Present when the chat was opened from a Click-to-WhatsApp ad or post. */
+  referral?: Referral;
+}
+
+/** Click-to-WhatsApp attribution, as sent by Meta on the first message from an ad. */
+export interface Referral {
+  sourceId?: string; // ad id
+  sourceType?: string; // 'ad' | 'post'
+  sourceUrl?: string;
+  headline?: string;
+  ctwaClid?: string; // click id, used for Conversions API attribution
 }
 
 /** Extract inbound messages from a webhook payload. Ignores status callbacks. */
@@ -47,11 +58,24 @@ export function parseWebhook(payload: unknown): InboundMessage[] {
           type: String(m.type ?? 'unknown'),
           text: extractText(m),
           profileName: names.get(m.from),
+          referral: parseReferral(m.referral),
         });
       }
     }
   }
   return out;
+}
+
+function parseReferral(r: any): Referral | undefined {
+  if (!r || typeof r !== 'object') return undefined;
+  const out: Referral = {
+    sourceId: r.source_id ? String(r.source_id) : undefined,
+    sourceType: r.source_type ? String(r.source_type) : undefined,
+    sourceUrl: r.source_url ? String(r.source_url) : undefined,
+    headline: r.headline ? String(r.headline).slice(0, 200) : undefined,
+    ctwaClid: r.ctwa_clid ? String(r.ctwa_clid) : undefined,
+  };
+  return Object.values(out).some(Boolean) ? out : undefined;
 }
 
 function extractText(m: any): string {
@@ -69,6 +93,13 @@ function extractText(m: any): string {
 
 export interface Sender {
   sendText(to: string, body: string): Promise<void>;
+  /** Pre-approved template: required for business-initiated messages outside the 24h customer service window. */
+  sendTemplate(to: string, name: string, params: string[], language?: string): Promise<void>;
+}
+
+/** WhatsApp only allows free-form business messages within 24h of the person's last message. */
+export function insideServiceWindow(lastInboundAt: Date | null | undefined, now: Date): boolean {
+  return !!lastInboundAt && now.getTime() - lastInboundAt.getTime() < 24 * 3_600_000;
 }
 
 /** Sends via the Graph API. Requires WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID. */
@@ -84,10 +115,27 @@ export class CloudApiSender implements Sender {
   }
 
   async sendText(to: string, body: string): Promise<void> {
+    await this.post({ messaging_product: 'whatsapp', to, type: 'text', text: { body, preview_url: false } });
+  }
+
+  async sendTemplate(to: string, name: string, params: string[], language = 'en'): Promise<void> {
+    await this.post({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: {
+        name,
+        language: { code: language },
+        components: params.length ? [{ type: 'body', parameters: params.map((text) => ({ type: 'text', text })) }] : [],
+      },
+    });
+  }
+
+  private async post(payload: unknown): Promise<void> {
     const res = await fetch(`https://graph.facebook.com/${this.apiVersion}/${this.phoneNumberId}/messages`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body, preview_url: false } }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(`WhatsApp send failed: ${res.status} ${await res.text()}`);
   }
@@ -95,13 +143,18 @@ export class CloudApiSender implements Sender {
 
 /** Dry-run sender for local development and tests. */
 export class MemorySender implements Sender {
-  sent: Array<{ to: string; body: string }> = [];
+  sent: Array<{ to: string; body: string; template?: string; params?: string[] }> = [];
   log: boolean;
   constructor(log = false) {
     this.log = log;
   }
   async sendText(to: string, body: string): Promise<void> {
     this.sent.push({ to, body });
+    if (this.log) console.log(`\n→ ${to}\n${body}\n`);
+  }
+  async sendTemplate(to: string, name: string, params: string[]): Promise<void> {
+    const body = `[template ${name}] ${params.join(' | ')}`;
+    this.sent.push({ to, body, template: name, params });
     if (this.log) console.log(`\n→ ${to}\n${body}\n`);
   }
 }

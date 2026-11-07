@@ -8,7 +8,7 @@ import { saDate } from '../src/saTime.ts';
 
 const SECRET = 'test-app-secret';
 
-function payload(id: string, from: string, body: string) {
+function payload(id: string, from: string, body: string, referral?: Record<string, string>) {
   return {
     object: 'whatsapp_business_account',
     entry: [
@@ -20,7 +20,7 @@ function payload(id: string, from: string, body: string) {
             value: {
               messaging_product: 'whatsapp',
               contacts: [{ wa_id: from, profile: { name: 'Thabo' } }],
-              messages: [{ id, from, timestamp: '1762675200', type: 'text', text: { body } }],
+              messages: [{ id, from, timestamp: '1762675200', type: 'text', text: { body }, ...(referral ? { referral } : {}) }],
             },
           },
         ],
@@ -100,7 +100,7 @@ test('end to end: signed messages drive the conversation; duplicates are ignored
   const s = await start();
   const phone = '27821234567';
   try {
-    const script = ['Hi', 'yes', 'yes', '0081', 'R4000', '1', 'cash', '1'];
+    const script = ['Hi', 'yes', '1', 'Bryanston', '1', 'today', '2', '1'];
     for (const [i, text] of script.entries()) {
       const res = await s.post(payload(`wamid.${i}`, phone, text));
       assert.equal(res.status, 200);
@@ -126,7 +126,7 @@ test('DELETE erases PII but keeps a hashed opt-out record', async () => {
   const s = await start();
   const phone = '27829999999';
   try {
-    for (const [i, text] of ['Hi', 'yes', 'yes', '0081', 'DELETE'].entries()) {
+    for (const [i, text] of ['Hi', 'yes', '1', 'Sandton', 'DELETE'].entries()) {
       await s.post(payload(`wamid.d${i}`, phone, text));
       await s.app.idle();
     }
@@ -143,6 +143,33 @@ test('DELETE erases PII but keeps a hashed opt-out record', async () => {
     await s.post(payload('wamid.d9', phone, 'hello again'));
     await s.app.idle();
     assert.equal(s.sender.sent.length, before);
+  } finally {
+    await s.close();
+  }
+});
+
+test('Click-to-WhatsApp referral is parsed and kept on the lead', async () => {
+  const [m] = parseWebhook(
+    payload('wamid.r1', '27825550000', 'Hi', {
+      source_id: '120210000000001',
+      source_type: 'ad',
+      source_url: 'https://fb.me/x',
+      headline: 'Dry taps in Bryanston?',
+      ctwa_clid: 'ARAkLkA8rmlFeiCktEJQ',
+    }),
+  );
+  assert.deepEqual(m.referral, {
+    sourceId: '120210000000001',
+    sourceType: 'ad',
+    sourceUrl: 'https://fb.me/x',
+    headline: 'Dry taps in Bryanston?',
+    ctwaClid: 'ARAkLkA8rmlFeiCktEJQ',
+  });
+  const s = await start();
+  try {
+    await s.post(payload('wamid.r1', '27825550000', 'Hi', { source_id: '1202', source_type: 'ad', ctwa_clid: 'clid-1' }));
+    await s.app.idle();
+    assert.equal(s.store.leads.get('27825550000')!.referral?.ctwaClid, 'clid-1');
   } finally {
     await s.close();
   }

@@ -28,3 +28,22 @@ export function nextAllowedTime(d: Date): Date {
   }
   throw new Error('No allowed contact time within 14 days — check holiday config');
 }
+
+// ---------- Service messages (reminders, attendance checks, installer briefs) ----------
+// Not direct marketing, so CPA s12 hours don't strictly apply, but we still keep
+// to a courtesy window so nobody gets a reminder at 05:30.
+
+import { SERVICE_WINDOW } from './config.ts';
+
+export function isServiceWindow(d: Date): boolean {
+  const h = saParts(d).hour;
+  return h >= SERVICE_WINDOW.startHour && h < SERVICE_WINDOW.endHour;
+}
+
+/** Earliest moment at or after `d` inside the service window. */
+export function nextServiceTime(d: Date): Date {
+  if (isServiceWindow(d)) return d;
+  let t = Math.ceil(d.getTime() / STEP_MS) * STEP_MS;
+  while (!isServiceWindow(new Date(t))) t += STEP_MS;
+  return new Date(t);
+}

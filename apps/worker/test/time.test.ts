@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { proposeSlots } from '../src/booking.ts';
+import { water } from '../src/playbooks/water.ts';
+import { solar } from '../src/playbooks/solar.ts';
 import { isContactAllowed, nextAllowedTime } from '../src/quietHours.ts';
 import { easterSunday, publicHolidays, saDate, saParts } from '../src/saTime.ts';
 
@@ -37,9 +39,9 @@ test('nextAllowedTime skips the weekend and holidays', () => {
   assert.equal(nextAllowedTime(xmasEve).getTime(), saDate(2026, 12, 28, 8, 0).getTime());
 });
 
-test('proposeSlots: business days, >=24h ahead, different days, avoids busy time', () => {
+test('proposeSlots (solar rules): business days, >=24h ahead, different days, avoids busy time', () => {
   const now = saDate(2026, 11, 13, 16, 0); // Friday 16:00
-  const slots = proposeSlots(now);
+  const slots = proposeSlots(now, solar.slots);
   assert.equal(slots.length, 3);
   const days = new Set(slots.map((s) => saParts(s.startsAt).day));
   assert.equal(days.size, 3);
@@ -50,6 +52,21 @@ test('proposeSlots: business days, >=24h ahead, different days, avoids busy time
   }
   const first = slots[0];
   const busy = [{ start: first.startsAt, end: first.endsAt }];
-  const again = proposeSlots(now, busy);
+  const again = proposeSlots(now, solar.slots, busy);
   assert.ok(!again.some((s) => s.startsAt.getTime() === first.startsAt.getTime()));
+});
+
+test('proposeSlots (water rules): urgent, earliest-first, Saturdays allowed, no Sundays/holidays', () => {
+  // Friday 15:30 -> nothing left today (16:00 is < 2h away) -> Saturday 08:00, 10:00, 12:00
+  const sat = proposeSlots(saDate(2026, 11, 13, 15, 30), water.slots);
+  assert.deepEqual(
+    sat.map((s) => s.startsAt.getTime()),
+    [saDate(2026, 11, 14, 8, 0), saDate(2026, 11, 14, 10, 0), saDate(2026, 11, 14, 12, 0)].map((d) => d.getTime()),
+  );
+  // Saturday evening -> skips Sunday -> Monday morning
+  const mon = proposeSlots(saDate(2026, 11, 14, 19, 0), water.slots);
+  assert.equal(mon[0].startsAt.getTime(), saDate(2026, 11, 16, 8, 0).getTime());
+  // 15 Dec 2026 evening -> 16 Dec is a public holiday -> 17 Dec
+  const rec = proposeSlots(saDate(2026, 12, 15, 19, 0), water.slots);
+  assert.equal(rec[0].startsAt.getTime(), saDate(2026, 12, 17, 8, 0).getTime());
 });

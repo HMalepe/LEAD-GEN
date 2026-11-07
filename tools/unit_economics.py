@@ -39,6 +39,55 @@ class Scenario:
     fixed_costs_month: float        # tooling, hosting, phone, insurance (excl. founder pay)
 
 
+# ---------------- Backup water systems, Sandton / Bryanston / Randburg (launch) ----------------
+# Job value: HC Water Backup published packages R15,550–R19,880 (see docs/06).
+# Funnel rates are higher than solar because demand is urgent (dry taps), and the
+# CPL is an ASSUMPTION for a hyper-local Click-to-WhatsApp audience: validate first.
+
+WATER_BASE = Scenario(
+    name="Water base",
+    cost_per_raw_lead=60.0,
+    raw_to_qualified=0.50,
+    qualified_to_booked=0.65,
+    ai_msg_cost_per_lead=3.0,
+    show_rate=0.85,
+    price_per_appointment=550.0,
+    platform_fee_per_client=1500.0,
+    client_close_rate=0.30,
+    client_avg_job_value=16_500.0,
+    client_gross_margin=0.30,
+    clients=12,
+    appointments_per_client=30,
+    fixed_costs_month=25_000.0,
+)
+
+WATER_CONSERVATIVE = replace(
+    WATER_BASE,
+    name="Water conservative",
+    cost_per_raw_lead=100.0,
+    raw_to_qualified=0.35,
+    qualified_to_booked=0.55,
+    show_rate=0.75,
+    price_per_appointment=450.0,
+    client_close_rate=0.22,
+    clients=6,
+    appointments_per_client=20,
+)
+
+WATER_AGGRESSIVE = replace(
+    WATER_BASE,
+    name="Water aggressive",
+    cost_per_raw_lead=40.0,
+    raw_to_qualified=0.55,
+    qualified_to_booked=0.70,
+    show_rate=0.90,
+    price_per_appointment=650.0,
+    clients=20,
+    appointments_per_client=40,
+)
+
+# ---------------- Residential solar, Gauteng (original thesis, now secondary) ----------------
+
 BASE = Scenario(
     name="Base",
     cost_per_raw_lead=120.0,
@@ -131,6 +180,18 @@ def evaluate(s: Scenario) -> Result:
     )
 
 
+VERTICALS = {
+    "water": [WATER_CONSERVATIVE, WATER_BASE, WATER_AGGRESSIVE],
+    "solar": [CONSERVATIVE, BASE, AGGRESSIVE],
+}
+
+
+def max_cost_per_raw_lead(s: Scenario, target_margin: float = 0.0) -> float:
+    """Highest paid-media CPL at which an attended appointment still earns `target_margin` of price."""
+    attended_per_raw = s.raw_to_qualified * s.qualified_to_booked * s.show_rate
+    return s.price_per_appointment * (1 - target_margin) * attended_per_raw - s.ai_msg_cost_per_lead
+
+
 def sensitivity(base: Scenario) -> list[tuple[str, float, float]]:
     """Operating-profit impact of a 20% adverse move in each key driver."""
     base_op = evaluate(base).monthly_operating_profit
@@ -152,7 +213,7 @@ def r(x: float) -> str:
     return f"R{x:,.0f}"
 
 
-def markdown(scenarios: list[Scenario]) -> str:
+def markdown(scenarios: list[Scenario], base: Scenario) -> str:
     rows = [(s, evaluate(s)) for s in scenarios]
     head = "| Metric | " + " | ".join(s.name for s, _ in rows) + " |"
     sep = "|---|" + "---:|" * len(rows)
@@ -177,11 +238,11 @@ def markdown(scenarios: list[Scenario]) -> str:
     add("Break-even appointments / month (excl. retainers)", lambda s, x: f"{x.breakeven_appointments:.0f}")
 
     lines.append("")
-    lines.append("**Sensitivity (Base scenario, 20% adverse move, ranked by damage):**")
+    lines.append(f"**Sensitivity ({base.name} scenario, 20% adverse move, ranked by damage):**")
     lines.append("")
     lines.append("| Shock | Operating profit / month | Change |")
     lines.append("|---|---:|---:|")
-    for label, op, delta in sensitivity(BASE):
+    for label, op, delta in sensitivity(base):
         lines.append(f"| {label} | {r(op)} | {r(delta)} |")
     return "\n".join(lines)
 
@@ -189,10 +250,16 @@ def markdown(scenarios: list[Scenario]) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--markdown", action="store_true", help="emit markdown tables")
+    p.add_argument("--vertical", choices=sorted(VERTICALS), default="water")
     args = p.parse_args()
-    scenarios = [CONSERVATIVE, BASE, AGGRESSIVE]
+    scenarios = VERTICALS[args.vertical]
+    base = scenarios[1]
     if args.markdown:
-        print(markdown(scenarios))
+        print(markdown(scenarios, base))
+        print()
+        print(f"**Kill switch:** at base-case conversion rates, paid media must stay under "
+              f"{r(max_cost_per_raw_lead(base))} per raw lead to break even per visit, and under "
+              f"{r(max_cost_per_raw_lead(base, 0.40))} to keep a 40% contribution margin.")
         return
     for s in scenarios:
         x = evaluate(s)

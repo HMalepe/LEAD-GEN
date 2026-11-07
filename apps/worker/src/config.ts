@@ -19,17 +19,18 @@ export const TERRITORY: Territory = {
 };
 
 /** Brand shown to consumers. Placeholder: set BRAND_NAME to your registered trading name. */
-export const BRAND = process.env.BRAND_NAME ?? 'LEAD-GEN Solar Desk';
+export const BRAND = process.env.BRAND_NAME ?? 'LEAD-GEN Home Services';
 export const PRIVACY_URL = process.env.PRIVACY_URL ?? 'https://example.com/privacy';
-
-/** Minimum score (0–100) to offer an appointment. See docs/03-architecture.md §4. */
-export const SCORE_THRESHOLD = 60;
 
 /** Unparseable answers in a row before a human takes over. */
 export const MAX_FAILED_PARSES = 3;
 
-/** Appointment slot starts (SAST, 24h) and length. */
-export const SLOT_TIMES = ['09:00', '12:00', '15:00'];
-export const SLOT_MINUTES = 90;
-/** Earliest bookable slot, hours from now. Gives the installer time to prepare. */
-export const MIN_LEAD_TIME_HOURS = 24;
+/** Courtesy window for service messages (reminders, attendance checks), SAST hours [start, end). */
+export const SERVICE_WINDOW = { startHour: 7, endHour: 21 };
+
+/** Days after an attended visit to ask the installer for the outcome. */
+export const OUTCOME_REQUEST_DAYS = [3, 7, 14];
+/** Installers with an attended visit older than this and no outcome stop receiving bookings. */
+export const OUTCOME_OVERDUE_DAYS = 14;
+/** Hours after attendance before the visit is billed (dispute window). */
+export const BILLING_DELAY_HOURS = 48;

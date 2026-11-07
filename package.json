@@ -20,6 +20,7 @@
     "check": "npm test && npm run check:model && npm run check:links"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
     "pg": "^8.23.1"
   }
 }

@@ -1,16 +1,20 @@
-// Postgres implementation of Store, on db/migrations/0001 + 0002.
-// Every save is one transaction: lead row + new consents + new messages + new appointments.
+// Postgres implementation of Store, on db/migrations/*.
+// Every save is one transaction: messages + consents + new appointments (with
+// their reminder/brief jobs, i.e. a transactional outbox) + status changes + lead row.
 
-import pg from 'pg';
+import type pg from 'pg';
 import { initialState } from '../agent.ts';
 import type { ConversationState, Stage } from '../agent.ts';
-import { hashPhone } from '../store.ts';
-import type { LeadRecord, Store } from '../store.ts';
+import { getPlaybook } from '../playbooks/index.ts';
+import { hashPhone, newRef } from '../store.ts';
+import type { LeadRecord, NewLeadOptions, Store } from '../store.ts';
+import { applyAppointmentStatus, resolveClientSql, scheduleBookingJobs } from './ops.ts';
 
 export interface PgStoreOptions {
-  vertical?: string; // leads.vertical / territories.vertical
-  /** Fallback client when no territory row matches the postal code. */
+  /** Fallback client when no territory row matches (e.g. a house account during the pilot). */
   defaultClientId?: string;
+  /** Only route to installers with prepaid credit for another visit (default true). */
+  requirePrepaid?: boolean;
 }
 
 /** Agent stage -> leads.status (the column dashboards and the funnel view read). */
@@ -33,12 +37,14 @@ export function statusFor(stage: Stage): string {
   }
 }
 
-/** JSON round-trip loses Date types; restore them on the slot fields. */
+/** JSON round-trip loses Date types; restore them, and upgrade pre-playbook states. */
 export function reviveState(raw: any): ConversationState {
   if (!raw || typeof raw !== 'object' || !raw.stage) return initialState();
   const slot = (s: any) => (s ? { startsAt: new Date(s.startsAt), endsAt: new Date(s.endsAt) } : undefined);
   return {
     ...raw,
+    playbook: raw.playbook ?? 'solar', // states saved before playbooks existed were solar
+    qIndex: raw.qIndex ?? 0,
     answers: raw.answers ?? {},
     failedParses: raw.failedParses ?? 0,
     offeredSlots: Array.isArray(raw.offeredSlots) ? raw.offeredSlots.map(slot) : undefined,
@@ -46,32 +52,31 @@ export function reviveState(raw: any): ConversationState {
   };
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export class PgStore implements Store {
   pool: pg.Pool;
-  vertical: string;
   defaultClientId?: string;
+  requirePrepaid: boolean;
 
   constructor(pool: pg.Pool, opts: PgStoreOptions = {}) {
     this.pool = pool;
-    this.vertical = opts.vertical ?? 'solar';
     this.defaultClientId = opts.defaultClientId;
+    this.requirePrepaid = opts.requirePrepaid ?? true;
   }
 
-  /** Fail fast at startup: a qualified lead must always have an installer to be booked with. */
+  /** Fail fast at startup: a qualified lead must always have somewhere to go. */
   async assertRoutable(): Promise<void> {
     if (this.defaultClientId) {
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(this.defaultClientId)) {
+      if (!UUID.test(this.defaultClientId)) {
         throw new Error(`DEFAULT_CLIENT_ID must be a client UUID, got "${this.defaultClientId}"`);
       }
       const r = await this.pool.query('select 1 from clients where id = $1 and active', [this.defaultClientId]);
       if (!r.rowCount) throw new Error(`DEFAULT_CLIENT_ID ${this.defaultClientId} is not an active client`);
       return;
     }
-    const r = await this.pool.query(
-      'select 1 from territories t join clients c on c.id = t.client_id where t.vertical = $1 and c.active limit 1',
-      [this.vertical],
-    );
-    if (!r.rowCount) throw new Error(`No active client territory for vertical '${this.vertical}' and no DEFAULT_CLIENT_ID`);
+    const r = await this.pool.query('select 1 from territories t join clients c on c.id = t.client_id where c.active limit 1');
+    if (!r.rowCount) throw new Error('No active client territory and no DEFAULT_CLIENT_ID: qualified leads could never be booked');
   }
 
   async markProcessed(providerId: string): Promise<boolean> {
@@ -82,15 +87,29 @@ export class PgStore implements Store {
     return r.rowCount === 1;
   }
 
-  async getOrCreateLead(phone: string, name: string | undefined, now: Date): Promise<LeadRecord> {
+  async getOrCreateLead(phone: string, name: string | undefined, now: Date, opts: NewLeadOptions = {}): Promise<LeadRecord> {
     const found = await this.pool.query('select * from leads where phone_e164 = any($1) limit 1', [[phone, hashPhone(phone)]]);
     if (found.rowCount) return this.toRecord(found.rows[0]);
+    const state = initialState(opts.playbook);
+    const ref = opts.referral;
+    const utm = ref
+      ? { source_id: ref.sourceId, source_type: ref.sourceType, source_url: ref.sourceUrl, headline: ref.headline }
+      : {};
     const ins = await this.pool.query(
-      `insert into leads (source, vertical, full_name, phone_e164, created_at, updated_at, conversation)
-       values ('click_to_whatsapp', $1, $2, $3, $4, $4, $5)
+      `insert into leads (source, vertical, full_name, phone_e164, created_at, updated_at, conversation, utm, ctwa_clid)
+       values ($1, $2, $3, $4, $5, $5, $6, $7, $8)
        on conflict (phone_e164) do update set updated_at = leads.updated_at
        returning *`,
-      [this.vertical, name ?? null, phone, now, JSON.stringify(initialState())],
+      [
+        ref?.sourceType === 'ad' || ref?.ctwaClid ? 'click_to_whatsapp' : 'manual',
+        getPlaybook(state.playbook).vertical,
+        name ?? null,
+        phone,
+        now,
+        JSON.stringify(state),
+        JSON.stringify(JSON.parse(JSON.stringify(utm))), // drop undefined keys
+        ref?.ctwaClid ?? null,
+      ],
     );
     return this.toRecord(ins.rows[0]);
   }
@@ -105,26 +124,35 @@ export class PgStore implements Store {
       state: reviveState(row.conversation),
       createdAt: new Date(row.created_at),
       firstResponseSeconds: row.first_response_seconds ?? undefined,
+      clientId: row.assigned_client,
       consents: [],
       messages: [],
       appointments: [],
+      appointmentUpdates: [],
       handoffs: row.handoffs ?? [],
       erasedAt: erased ? new Date(row.erased_at) : undefined,
     };
   }
 
-  async save(lead: LeadRecord): Promise<void> {
-    await this.tx((c) => this.saveIn(c, lead));
+  async resolveClient(lead: LeadRecord, now: Date): Promise<string | null> {
+    const pb = getPlaybook(lead.state.playbook);
+    const loc = pb.location(lead.state.answers);
+    const id = await resolveClientSql(this.pool, { vertical: pb.vertical, ...loc, now, requirePrepaid: this.requirePrepaid });
+    return id ?? this.defaultClientId ?? null;
+  }
+
+  async save(lead: LeadRecord, now: Date): Promise<void> {
+    await this.tx((c) => this.saveIn(c, lead, now));
   }
 
   async erase(lead: LeadRecord, now: Date): Promise<void> {
     await this.tx(async (c) => {
-      await this.saveIn(c, lead);
+      await this.saveIn(c, lead, now);
       const hashed = lead.phone ? hashPhone(lead.phone) : lead.key;
       lead.state.answers = {};
       await c.query(
         `update leads set phone_e164 = $2, full_name = null, email = null, postal_code = null,
-           qualification = '{}'::jsonb, conversation = $3, utm = '{}'::jsonb, erased_at = $4, updated_at = $4
+           qualification = '{}'::jsonb, conversation = $3, utm = '{}'::jsonb, ctwa_clid = null, erased_at = $4, updated_at = $4
          where id = $1`,
         [lead.id, hashed, JSON.stringify(lead.state), now],
       );
@@ -138,29 +166,7 @@ export class PgStore implements Store {
     });
   }
 
-  private async saveIn(c: pg.PoolClient, lead: LeadRecord): Promise<void> {
-    const s = lead.state;
-    let clientId: string | null = null;
-    if (lead.appointments.some((a) => !a.id)) clientId = await this.resolveClient(c, s.answers.postalCode);
-
-    await c.query(
-      `update leads set status = $2, score = $3, qualification = $4, conversation = $5, postal_code = $6,
-         first_response_seconds = coalesce(first_response_seconds, $7), handoffs = $8,
-         assigned_client = coalesce($9, assigned_client), updated_at = now()
-       where id = $1`,
-      [
-        lead.id,
-        statusFor(s.stage),
-        s.score ?? null,
-        JSON.stringify(s.answers),
-        JSON.stringify(s),
-        s.answers.postalCode ?? null,
-        lead.firstResponseSeconds ?? null,
-        lead.handoffs,
-        clientId,
-      ],
-    );
-
+  private async saveIn(c: pg.PoolClient, lead: LeadRecord, now: Date): Promise<void> {
     for (const k of lead.consents.filter((x) => !x.id)) {
       const r = await c.query(
         `insert into consents (lead_id, purpose, granted, channel, wording, evidence, recorded_at)
@@ -172,39 +178,62 @@ export class PgStore implements Store {
 
     for (const m of lead.messages.filter((x) => !x.id)) {
       const r = await c.query(
-        `insert into messages (lead_id, channel, direction, body, provider_id, author, created_at)
-         values ($1, 'whatsapp', $2, $3, $4, $5, $6) returning id`,
-        [lead.id, m.direction, m.body, m.providerId ?? null, m.direction === 'inbound' ? 'lead' : 'agent', m.at],
+        `insert into messages (lead_id, channel, direction, body, provider_id, author, model, tokens_in, tokens_out, created_at)
+         values ($1, 'whatsapp', $2, $3, $4, $5, $6, $7, $8, $9) returning id`,
+        [
+          lead.id,
+          m.direction,
+          m.body,
+          m.providerId ?? null,
+          m.direction === 'inbound' ? 'lead' : 'agent',
+          m.model ?? null,
+          m.tokensIn ?? null,
+          m.tokensOut ?? null,
+          m.at,
+        ],
       );
       m.id = r.rows[0].id;
     }
 
-    for (const a of lead.appointments.filter((x) => !x.id)) {
-      if (!clientId) {
-        throw new Error(
-          `No client for postal code ${s.answers.postalCode ?? '?'}: add a territories row or set DEFAULT_CLIENT_ID`,
-        );
-      }
-      const r = await c.query(
-        `insert into appointments (lead_id, client_id, starts_at, ends_at) values ($1, $2, $3, $4) returning id`,
-        [lead.id, clientId, a.startsAt, a.endsAt],
-      );
-      a.id = r.rows[0].id;
-      a.clientId = clientId;
-    }
-  }
+    // Status changes first (a reschedule cancels the old visit before the new one is inserted).
+    for (const u of lead.appointmentUpdates.splice(0)) await applyAppointmentStatus(c, u, now);
 
-  /** Territory routing: the client holding this vertical + postal code, else the default client. */
-  private async resolveClient(c: pg.PoolClient, postalCode: string | undefined): Promise<string | null> {
-    if (postalCode) {
+    for (const a of lead.appointments.filter((x) => !x.id)) {
+      const clientId = lead.clientId ?? (await this.resolveClient(lead, now));
+      if (!clientId) {
+        throw new Error(`No installer available for ${JSON.stringify(getPlaybook(lead.state.playbook).location(lead.state.answers))}`);
+      }
+      const ref = newRef();
       const r = await c.query(
-        `select t.client_id from territories t join clients cl on cl.id = t.client_id
-         where t.vertical = $1 and $2 = any(t.postal_codes) and cl.active limit 1`,
-        [this.vertical, postalCode],
+        `insert into appointments (lead_id, client_id, starts_at, ends_at, ref) values ($1, $2, $3, $4, $5) returning id`,
+        [lead.id, clientId, a.startsAt, a.endsAt, ref],
       );
-      if (r.rowCount) return r.rows[0].client_id;
+      Object.assign(a, { id: r.rows[0].id, ref, clientId, status: 'scheduled' });
+      lead.clientId = clientId;
+      lead.state.appointmentId = a.id;
+      await scheduleBookingJobs(c, { id: a.id!, leadId: lead.id!, clientId, startsAt: a.startsAt, endsAt: a.endsAt }, now);
     }
-    return this.defaultClientId ?? null;
+
+    const s = lead.state;
+    const loc = getPlaybook(s.playbook).location(s.answers);
+    await c.query(
+      `update leads set status = $2, score = $3, qualification = $4, conversation = $5, postal_code = $6,
+         first_response_seconds = coalesce(first_response_seconds, $7), handoffs = $8,
+         assigned_client = coalesce($9, assigned_client), updated_at = $10
+       where id = $1`,
+      [
+        lead.id,
+        statusFor(s.stage),
+        s.score ?? null,
+        JSON.stringify(s.answers),
+        JSON.stringify(s),
+        loc.postalCode ?? null,
+        lead.firstResponseSeconds ?? null,
+        lead.handoffs,
+        lead.clientId ?? null,
+        now,
+      ],
+    );
   }
 
   private async tx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {

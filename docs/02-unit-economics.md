@@ -67,7 +67,7 @@ The fix is structural: **prepaid appointment credit.**
 - Ads for a client pause automatically when their credit covers less than 1 week of expected appointments.
 - Result: clients fund the ad spend, so growth doesn't need debt or outside capital.
 
-This rule is enforced in the data model (`clients.prepaid_credit` in [`db/schema.sql`](../db/schema.sql)).
+This rule is enforced in the data model (`clients.prepaid_credit` in [`db/migrations/0001_init.sql`](../db/migrations/0001_init.sql)).
 
 ## 5. Assumption register (validate or kill in the pilot)
 

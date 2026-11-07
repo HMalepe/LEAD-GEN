@@ -11,6 +11,9 @@ import { pathToFileURL } from 'node:url';
 import { handleMessage } from './agent.ts';
 import type { AgentContext } from './agent.ts';
 import { proposeSlots } from './booking.ts';
+import pg from 'pg';
+import { migrate } from './db/migrate.ts';
+import { PgStore } from './db/pgStore.ts';
 import { MemoryStore } from './store.ts';
 import type { LeadRecord, Store } from './store.ts';
 import { CloudApiSender, MemorySender, parseWebhook, verifySignature } from './whatsapp.ts';
@@ -48,9 +51,10 @@ export function createApp(opts: AppOptions): App {
     const lead = await opts.store.getOrCreateLead(msg.from, msg.profileName, t);
     lead.messages.push({ direction: 'inbound', body: msg.text, providerId: msg.id, at: t });
 
-    if (msg.text === '' && lead.state.stage !== 'opted_out') {
-      await reply(lead, ["Sorry, I can only read text messages for now. Please type your answer. 🙏"], t);
-      await opts.store.save(lead);
+    if (msg.text === '') {
+      const outbound =
+        lead.state.stage === 'opted_out' ? [] : ['Sorry, I can only read text messages for now. Please type your answer. 🙏'];
+      await persistThenSend(lead, outbound, t, false);
       return;
     }
 
@@ -71,19 +75,31 @@ export function createApp(opts: AppOptions): App {
       else if (ev.type === 'handoff') lead.handoffs.push(ev.reason);
       else if (ev.type === 'erase') erase = true;
     }
-    await reply(lead, result.replies, t);
-    if (erase) await opts.store.erase(lead, t);
-    else await opts.store.save(lead);
+    await persistThenSend(lead, result.replies, t, erase);
   }
 
-  async function reply(lead: LeadRecord, bodies: string[], t: Date): Promise<void> {
-    for (const body of bodies) {
-      if (!lead.phone) break;
-      await opts.sender.sendText(lead.phone, body);
-      if (lead.firstResponseSeconds === undefined) {
-        lead.firstResponseSeconds = Math.round((now().getTime() - lead.createdAt.getTime()) / 1000);
+  /**
+   * Commit state first, then send. A crash between the two can lose a reply
+   * (recoverable: the lead writes again) but can never confirm a booking that
+   * was not recorded. A failed send is flagged for a human.
+   */
+  async function persistThenSend(lead: LeadRecord, bodies: string[], t: Date, erase: boolean): Promise<void> {
+    const phone = lead.phone;
+    for (const body of bodies) lead.messages.push({ direction: 'outbound', body, at: t });
+    if (bodies.length && lead.firstResponseSeconds === undefined) {
+      lead.firstResponseSeconds = Math.round((now().getTime() - lead.createdAt.getTime()) / 1000);
+    }
+    if (erase) await opts.store.erase(lead, t);
+    else await opts.store.save(lead);
+    if (!phone) return;
+    try {
+      for (const body of bodies) await opts.sender.sendText(phone, body);
+    } catch (e) {
+      onError(e);
+      if (!erase) {
+        lead.handoffs.push('send_failed');
+        await opts.store.save(lead);
       }
-      lead.messages.push({ direction: 'outbound', body, at: t });
     }
   }
 
@@ -183,10 +199,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const sender: Sender = token && phoneId ? new CloudApiSender(token, phoneId) : new MemorySender(true);
   if (!(token && phoneId)) console.warn('[worker] DRY RUN: replies are printed, not sent.');
 
-  const app = createApp({ store: new MemoryStore(), sender, appSecret, verifyToken, allowUnsigned });
+  let store: Store = new MemoryStore();
+  let pool: pg.Pool | undefined;
+  if (process.env.DATABASE_URL) {
+    pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+    try {
+      await migrate(pool);
+      const pgStore = new PgStore(pool, { defaultClientId: process.env.DEFAULT_CLIENT_ID || undefined });
+      await pgStore.assertRoutable();
+      store = pgStore;
+    } catch (e) {
+      console.error(`[worker] startup failed: ${(e as Error).message}`);
+      await pool.end();
+      process.exit(1);
+    }
+    console.log('[worker] store: Postgres');
+  } else {
+    console.warn('[worker] store: in-memory (set DATABASE_URL to persist)');
+  }
+
+  const app = createApp({ store, sender, appSecret, verifyToken, allowUnsigned });
   const port = Number(process.env.PORT ?? 3000);
   app.server.listen(port, () => console.log(`[worker] listening on :${port}`));
-  const shutdown = () => app.server.close(async () => (await app.idle(), process.exit(0)));
+  const shutdown = () => app.server.close(async () => (await app.idle(), await pool?.end(), process.exit(0)));
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

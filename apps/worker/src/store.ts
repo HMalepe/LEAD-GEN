@@ -1,6 +1,8 @@
-// Persistence boundary. MemoryStore runs the MVP and the tests; a Postgres
-// implementation of the same interface maps 1:1 onto db/schema.sql
-// (leads, consents, messages, appointments).
+// Persistence boundary. MemoryStore runs local dev and fast tests; PgStore
+// (db/pgStore.ts) implements the same interface on db/migrations/*.sql.
+//
+// Append-only collections (consents, messages, appointments) hold the records
+// created in this process; a record without `id` has not been persisted yet.
 
 import { createHash } from 'node:crypto';
 import { initialState } from './agent.ts';
@@ -8,6 +10,7 @@ import type { ConsentPurpose, ConversationState } from './agent.ts';
 import type { Slot } from './booking.ts';
 
 export interface ConsentRecord {
+  id?: string;
   purpose: ConsentPurpose;
   granted: boolean;
   channel: 'whatsapp';
@@ -17,13 +20,20 @@ export interface ConsentRecord {
 }
 
 export interface MessageRecord {
+  id?: string;
   direction: 'inbound' | 'outbound';
   body: string;
   providerId?: string;
   at: Date;
 }
 
+export interface AppointmentRecord extends Slot {
+  id?: string;
+  clientId?: string;
+}
+
 export interface LeadRecord {
+  id?: string;
   key: string; // phone (or sha256 of phone after erasure)
   phone: string | null;
   name: string | null;
@@ -32,7 +42,7 @@ export interface LeadRecord {
   firstResponseSeconds?: number;
   consents: ConsentRecord[];
   messages: MessageRecord[];
-  appointments: Slot[];
+  appointments: AppointmentRecord[];
   handoffs: string[];
   erasedAt?: Date;
 }
@@ -42,6 +52,7 @@ export interface Store {
   markProcessed(providerId: string): Promise<boolean>;
   getOrCreateLead(phone: string, name: string | undefined, now: Date): Promise<LeadRecord>;
   save(lead: LeadRecord): Promise<void>;
+  /** Persist the lead's latest state, then erase its PII (POPIA s24). */
   erase(lead: LeadRecord, now: Date): Promise<void>;
 }
 
@@ -77,10 +88,7 @@ export class MemoryStore implements Store {
     this.leads.set(lead.key, lead);
   }
 
-  /**
-   * POPIA s24 erasure: drop PII and message bodies, keep a hashed key and the
-   * opt-out record so we can still honour "never contact again".
-   */
+  /** Drop PII and message bodies; keep a hashed key and the opt-out so we still never re-contact. */
   async erase(lead: LeadRecord, now: Date): Promise<void> {
     if (lead.phone) this.leads.delete(lead.phone);
     const key = lead.phone ? hashPhone(lead.phone) : lead.key;

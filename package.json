@@ -9,9 +9,17 @@
   },
   "scripts": {
     "test": "node --test apps/worker/test/*.test.ts",
+    "test:db": "TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://leadgen:leadgen@localhost:5432/leadgen_test} node --test apps/worker/test/*.test.ts",
     "start": "node apps/worker/src/server.ts",
     "dev": "ALLOW_UNSIGNED=1 node --watch apps/worker/src/server.ts",
     "simulate": "node apps/worker/src/simulate.ts",
-    "model": "python3 tools/unit_economics.py --markdown"
+    "db:migrate": "node apps/worker/src/db/migrate.ts",
+    "model": "python3 tools/unit_economics.py --markdown",
+    "check:model": "bash tools/check_model.sh",
+    "check:links": "python3 tools/check_links.py",
+    "check": "npm test && npm run check:model && npm run check:links"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }

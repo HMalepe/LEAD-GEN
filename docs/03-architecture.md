@@ -59,7 +59,7 @@ flowchart LR
 |---|---|---|
 | Language | **TypeScript** end to end | One language for web, API and workers. Big hiring pool. |
 | Web + API | **Next.js** on **Vercel** | Landing pages, client dashboard and API routes in one deployable unit |
-| Database + auth | **Supabase** (Postgres, Row Level Security, Auth) | Managed Postgres. RLS gives multi-tenant isolation per client for free. Schema in [`db/schema.sql`](../db/schema.sql). |
+| Database + auth | **Supabase** (Postgres, Row Level Security, Auth) | Managed Postgres. RLS gives multi-tenant isolation per client for free. Schema in [`db/migrations/`](../db/migrations). |
 | Queue / workers | Supabase `pg_cron` + a job table at first; **Inngest** or **Trigger.dev** at scale | Webhooks must return in under a second. All AI work runs asynchronously, with retries. |
 | Messaging | **WhatsApp Business Cloud API** (Meta) as primary; **Twilio** SMS as fallback | WhatsApp dominates in SA. SMS covers numbers that aren't on WhatsApp. |
 | LLM | **Claude API**, tiered: a small, fast model for classification and extraction; a larger model for the open conversation | Cost control: most turns are cheap extraction, and only the hard turns use the big model |
@@ -134,13 +134,13 @@ The client dashboard and WhatsApp send a one-tap **Won / Lost / Pending** reques
 LEAD-GEN/
 ├── apps/
 │   ├── web/            # Next.js: landing pages + client dashboard + API routes
-│   └── worker/         # queue consumers: agent, reminders, billing
+│   └── worker/         # WhatsApp webhook + agent + Postgres store (exists); reminders, billing next
 ├── packages/
 │   ├── agent/          # prompts, tool definitions, guardrails, evals
 │   ├── scoring/        # rules v0 -> models v1+
 │   └── db/             # typed client generated from schema
 ├── db/
-│   └── schema.sql      # source of truth (exists)
+│   └── migrations/     # 0001 init · 0002 worker state · 0003 handoff queue (exists)
 ├── tools/
 │   └── unit_economics.py  # financial model (exists)
 └── docs/               # this plan
@@ -150,7 +150,7 @@ LEAD-GEN/
 
 | # | Step | Status |
 |---|---|---|
-| 1 | `db/schema.sql` applied, plus RLS policies | ✅ Schema verified on Postgres 16 · ⏳ RLS policies |
+| 1 | Schema migrations, plus RLS policies | ✅ `db/migrations/` with a tracked runner (`npm run db:migrate`) · ⏳ RLS policies |
 | 2 | WhatsApp webhook → stored message → reply | ✅ `apps/worker/src/server.ts`: signature check, idempotency, per-lead serial queue |
 | 3 | Qualification agent (5 questions, structured extraction, scoring v0) | ✅ `apps/worker/src/agent.ts`: pure state machine, STOP/DELETE/human handoff |
 | 4 | Booking against client availability | ✅ Slot proposal (business days, holidays, busy times) · ⏳ Google Calendar adapter |
@@ -159,7 +159,7 @@ LEAD-GEN/
 | 7 | Paystack prepaid top-ups and automatic invoices | ⏳ |
 | 8 | Funnel dashboard (Metabase on `funnel_daily`) | ⏳ |
 | 9 | Outcome-based scoring v1 and offline conversion upload to the ad platforms | ⏳ |
-| 10 | Postgres `Store` adapter (replaces `MemoryStore`, same interface) | ⏳ Next |
+| 10 | Postgres `Store` adapter (replaces `MemoryStore`, same interface) | ✅ `apps/worker/src/db/pgStore.ts`: transactional saves, territory routing, POPIA erasure, restart-safe |
 | 11 | LLM fallback for free-text answers the rule parsers can't read | ⏳ Next. It cuts handoffs; the rules stay first because they are free and instant. |
 
 ### Implemented-worker design notes
@@ -168,4 +168,16 @@ LEAD-GEN/
 - **Webhook acks in < 1 s, then processes asynchronously**, serially per phone number, so out-of-order delivery can't corrupt one lead's state.
 - **Idempotency:** Meta re-delivers webhooks, and a duplicate `wamid` is a no-op (tested).
 - **Compliance in code:** the first message identifies the bot as automated and states the opt-out. STOP withdraws all consent purposes and silences the bot. DELETE erases PII but keeps a hashed opt-out record, so a returning number is still never contacted.
-- **Zero runtime dependencies.** Node ≥ 22.18 runs TypeScript natively. Nothing to install and no supply-chain surface.
+- **Persist, then send.** State is committed before any reply goes out, so the bot can never confirm a booking that wasn't recorded (tested). A failed send is flagged `send_failed` for a human.
+- **Restart-safe.** The full conversation state is stored as JSON on the lead row, so a deploy or crash resumes every chat mid-question (tested by restarting the worker between messages).
+- **Territory routing.** A booking goes to the client whose `territories` row covers the postal code, else `DEFAULT_CLIENT_ID`. The worker refuses to start if no booking could ever be routed.
+- **One runtime dependency (`pg`).** Node ≥ 22.18 runs TypeScript natively, so there's no build step.
+- **CI** (`.github/workflows/ci.yml`) runs every test against a real Postgres 16, and fails if the docs' numbers drift from the financial model or any doc link breaks.
+
+### Known limits (accepted for the pilot, fix before scale)
+
+| Limit | Impact | Fix |
+|---|---|---|
+| Per-lead ordering is in-process only | Running 2+ worker instances could interleave one lead's messages | `select … for update` on the lead row, or a queue keyed by phone (Inngest / Trigger.dev) |
+| A crash between ack and save loses that one inbound message | The lead has to repeat one answer | Write the raw webhook to an inbox table before acking, and process from there |
+| Rule-based parsing only | Unusual phrasing goes to a human after 3 tries | LLM fallback (step 11) |

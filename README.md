@@ -34,24 +34,25 @@ Launch market: residential solar and backup power installers, Gauteng. Expansion
 
 | Path | What it is |
 |---|---|
-| [`apps/worker/`](apps/worker/src) | **Working MVP:** WhatsApp webhook server and AI qualification + booking agent. 29 tests. |
+| [`apps/worker/`](apps/worker/src) | **Working MVP:** WhatsApp webhook server, qualification + booking agent, Postgres persistence. 37 tests, including a real Postgres database. |
 | [`tools/unit_economics.py`](tools/unit_economics.py) | The financial model. Every number in the docs comes from it. |
-| [`db/schema.sql`](db/schema.sql) | Postgres schema: leads, consent ledger, appointments, outcomes, billing, funnel view. Verified on PostgreSQL 16. |
+| [`db/migrations/`](db/migrations) | Postgres schema as ordered migrations: leads, consent ledger, appointments, outcomes, billing, funnel view, handoff queue |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: all tests on Postgres 16, docs-vs-model check, link check |
 
-### Run it (Node ≥ 22.18, Python ≥ 3.10, no installs needed)
+### Run it (Node ≥ 22.18, Python ≥ 3.10)
 
 ```bash
-npm test            # 29 tests: agent flows, parsers, CPA quiet hours, SA holidays, signed webhooks, POPIA erasure
+npm install         # one dependency: pg
+npm test            # agent flows, parsers, CPA quiet hours, SA holidays, signed webhooks, POPIA erasure
+npm run test:db     # same, plus Postgres integration (needs a local *_test database)
+npm run check       # tests + docs-match-model + link check (what CI runs)
 npm run simulate    # chat with the agent in your terminal, playing the homeowner
-npm run dev         # webhook server on :3000, dry run (prints replies instead of sending)
+npm run dev         # webhook server on :3000, in-memory, dry run (prints replies instead of sending)
 npm run model       # re-run the financial model
 
-# Production (real WhatsApp)
-WHATSAPP_APP_SECRET=... WHATSAPP_VERIFY_TOKEN=... \
-WHATSAPP_TOKEN=... WHATSAPP_PHONE_NUMBER_ID=... npm start
-
-# Apply the schema to a local or Supabase Postgres
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
+# Production: copy .env.example, fill it in, then
+npm run db:migrate  # applies db/migrations/*.sql once each (the server also runs this on start)
+npm start           # uses Postgres when DATABASE_URL is set
 ```
 
 ### What the agent does today

@@ -34,15 +34,35 @@ Launch market: residential solar and backup power installers, Gauteng. Expansion
 
 | Path | What it is |
 |---|---|
+| [`apps/worker/`](apps/worker/src) | **Working MVP:** WhatsApp webhook server and AI qualification + booking agent. 29 tests. |
 | [`tools/unit_economics.py`](tools/unit_economics.py) | The financial model. Every number in the docs comes from it. |
 | [`db/schema.sql`](db/schema.sql) | Postgres schema: leads, consent ledger, appointments, outcomes, billing, funnel view. Verified on PostgreSQL 16. |
 
+### Run it (Node ≥ 22.18, Python ≥ 3.10, no installs needed)
+
 ```bash
-# Re-run the financial model (Python 3.10+, no dependencies)
-python3 tools/unit_economics.py --markdown
+npm test            # 29 tests: agent flows, parsers, CPA quiet hours, SA holidays, signed webhooks, POPIA erasure
+npm run simulate    # chat with the agent in your terminal, playing the homeowner
+npm run dev         # webhook server on :3000, dry run (prints replies instead of sending)
+npm run model       # re-run the financial model
+
+# Production (real WhatsApp)
+WHATSAPP_APP_SECRET=... WHATSAPP_VERIFY_TOKEN=... \
+WHATSAPP_TOKEN=... WHATSAPP_PHONE_NUMBER_ID=... npm start
 
 # Apply the schema to a local or Supabase Postgres
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
+```
+
+### What the agent does today
+
+```
+Homeowner: Hi                 →  Bot: identifies itself as automated, explains purpose, YES / STOP / DELETE
+Homeowner: yes                →  consent logged (exact wording) → 1/5 Do you own the property?
+...5 questions...             →  homeowner? in territory? bill? timeline? payment? → score 0–100
+score ≥ 60                    →  3 slots on business days (no Sundays or SA public holidays, ≥ 24h ahead)
+Homeowner: 2                  →  ✅ booked
+STOP / DELETE / "a human"     →  handled at any point: opt-out, POPIA erasure, human handoff
 ```
 
 ## Principles

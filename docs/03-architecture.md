@@ -148,12 +148,24 @@ LEAD-GEN/
 
 ## 8. Build order (engineering)
 
-1. `db/schema.sql` applied, plus RLS policies ← **schema done and verified on Postgres 16**
-2. WhatsApp webhook → stored message → echo reply (proves the pipe end to end)
-3. Qualification agent with 5 hard-coded questions and structured extraction
-4. Booking against one client's Google Calendar
-5. Show-rate reminders (scheduled jobs)
-6. Client dashboard: appointment list plus the Won/Lost button
-7. Paystack prepaid top-ups and automatic invoices from attended appointments
-8. Funnel dashboard (Metabase on `funnel_daily`)
-9. Outcome-based scoring v1 and offline conversion upload to the ad platforms
+| # | Step | Status |
+|---|---|---|
+| 1 | `db/schema.sql` applied, plus RLS policies | ✅ Schema verified on Postgres 16 · ⏳ RLS policies |
+| 2 | WhatsApp webhook → stored message → reply | ✅ `apps/worker/src/server.ts`: signature check, idempotency, per-lead serial queue |
+| 3 | Qualification agent (5 questions, structured extraction, scoring v0) | ✅ `apps/worker/src/agent.ts`: pure state machine, STOP/DELETE/human handoff |
+| 4 | Booking against client availability | ✅ Slot proposal (business days, holidays, busy times) · ⏳ Google Calendar adapter |
+| 5 | Show-rate reminders | ✅ CPA quiet-hours + SA holiday engine (`quietHours.ts`) · ⏳ reminder scheduler |
+| 6 | Client dashboard: appointment list plus Won/Lost button | ⏳ |
+| 7 | Paystack prepaid top-ups and automatic invoices | ⏳ |
+| 8 | Funnel dashboard (Metabase on `funnel_daily`) | ⏳ |
+| 9 | Outcome-based scoring v1 and offline conversion upload to the ad platforms | ⏳ |
+| 10 | Postgres `Store` adapter (replaces `MemoryStore`, same interface) | ⏳ Next |
+| 11 | LLM fallback for free-text answers the rule parsers can't read | ⏳ Next. It cuts handoffs; the rules stay first because they are free and instant. |
+
+### Implemented-worker design notes
+
+- **The agent is a pure function** `(state, text, ctx) → (state, replies, events)`. Every conversation path is unit-tested with no network, DB or LLM. Side effects (sending, consent ledger, booking, erasure) are applied by the server from `events`.
+- **Webhook acks in < 1 s, then processes asynchronously**, serially per phone number, so out-of-order delivery can't corrupt one lead's state.
+- **Idempotency:** Meta re-delivers webhooks, and a duplicate `wamid` is a no-op (tested).
+- **Compliance in code:** the first message identifies the bot as automated and states the opt-out. STOP withdraws all consent purposes and silences the bot. DELETE erases PII but keeps a hashed opt-out record, so a returning number is still never contacted.
+- **Zero runtime dependencies.** Node ≥ 22.18 runs TypeScript natively. Nothing to install and no supply-chain surface.

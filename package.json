@@ -1,0 +1,17 @@
+{
+  "name": "lead-gen",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI-qualified, booked, attended appointments for South African home-service businesses.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test apps/worker/test/*.test.ts",
+    "start": "node apps/worker/src/server.ts",
+    "dev": "ALLOW_UNSIGNED=1 node --watch apps/worker/src/server.ts",
+    "simulate": "node apps/worker/src/simulate.ts",
+    "model": "python3 tools/unit_economics.py --markdown"
+  }
+}
